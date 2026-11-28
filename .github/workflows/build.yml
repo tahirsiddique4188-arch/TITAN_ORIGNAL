@@ -1,0 +1,434 @@
+name: Titan Forge v4.0 Universal Cloud APK + Auto-OTA
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: 'temurin'
+          cache: gradle
+
+      - name: Accept Android SDK Licenses
+        run: |
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null 2>&1 || true
+
+      - name: Detect Build Mode & Prepare Gradle
+        id: prep
+        run: |
+          MODE="debug"
+          if [ -f ".titan_build_mode" ]; then
+            MODE="$(tr -d '[:space:]' < .titan_build_mode)"
+          fi
+          echo "mode=${MODE}" >> "$GITHUB_OUTPUT"
+          if [ -f "./gradlew" ]; then
+            chmod +x ./gradlew
+            echo "cmd=./gradlew" >> "$GITHUB_OUTPUT"
+          else
+            echo "cmd=gradle" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Titan Forge v4.0 Universal Auto-OTA & 1-Line Change Stamper
+        if: steps.prep.outputs.mode == 'release'
+        env:
+          GH_REPO_FULL: ${{ github.repository }}
+          GH_RUN_NUM: ${{ github.run_number }}
+          GH_SHA_SHORT: ${{ github.sha }}
+        run: |
+          python3 - << 'PYEOF'
+          import os, re
+          from pathlib import Path
+
+          repo = os.environ.get("GH_REPO_FULL", "").strip()
+          run_num = int(os.environ.get("GH_RUN_NUM", "1") or "1")
+          sha_short = os.environ.get("GH_SHA_SHORT", "0000000")[:7]
+          build_stamp = f"{run_num}-{sha_short}"
+
+          app_dir = Path("app")
+          if not app_dir.exists():
+              print("No standard app/ module found; skipping universal OTA injection.")
+              raise SystemExit(0)
+
+          # 1. Ensure versionCode is always >= run_num so even a 1-line edit installs cleanly over old APK!
+          gfile = app_dir / "build.gradle.kts"
+          if not gfile.exists():
+              gfile = app_dir / "build.gradle"
+          if gfile.exists():
+              gtxt = gfile.read_text(encoding="utf-8")
+              m = re.search(r'(versionCode\s*=?\s*)(\d+)', gtxt)
+              if m:
+                  cur_vc = int(m.group(2))
+                  if cur_vc < run_num:
+                      gtxt = gtxt[:m.start(2)] + str(run_num) + gtxt[m.end(2):]
+                      gfile.write_text(gtxt, encoding="utf-8")
+                      print(f"Auto-bumped versionCode {cur_vc} -> {run_num} for seamless 1-line OTA update!")
+
+          # 2. Write OTA Stamp Resource XML (works on ALL Android apps even without BuildConfig!)
+          res_val_dir = app_dir / "src/main/res/values"
+          res_val_dir.mkdir(parents=True, exist_ok=True)
+          (res_val_dir / "titan_forge_ota.xml").write_text(f'''<?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <string name="titan_forge_ota_repo" translatable="false">{repo}</string>
+              <string name="titan_forge_ota_stamp" translatable="false">{build_stamp}</string>
+              <integer name="titan_forge_ota_run">{run_num}</integer>
+          </resources>
+          '''.replace("          ", ""), encoding="utf-8")
+
+          # 3. Check if project ALREADY has TitanInAppUpdater (e.g. Titan IDE itself)
+          has_custom_updater = any(app_dir.rglob("TitanInAppUpdater.kt"))
+          if has_custom_updater:
+              print("Project already has TitanInAppUpdater.kt — skipping duplicate provider injection.")
+              raise SystemExit(0)
+
+          # 4. Auto-Inject Universal Zero-Config Pure-Java OTA Auto-Updater into ANY Android App!
+          xml_dir = app_dir / "src/main/res/xml"
+          xml_dir.mkdir(parents=True, exist_ok=True)
+          (xml_dir / "titan_forge_ota_paths.xml").write_text('''<?xml version="1.0" encoding="utf-8"?>
+          <paths>
+              <cache-path name="titan_ota_cache" path="." />
+              <files-path name="titan_ota_files" path="." />
+          </paths>
+          '''.replace("          ", ""), encoding="utf-8")
+
+          java_pkg_dir = app_dir / "src/main/java/com/titanforge/ota"
+          java_pkg_dir.mkdir(parents=True, exist_ok=True)
+
+          (java_pkg_dir / "TitanForgeFileProvider.java").write_text('''package com.titanforge.ota;
+          import androidx.core.content.FileProvider;
+          public class TitanForgeFileProvider extends FileProvider {}
+          '''.replace("          ", ""), encoding="utf-8")
+
+          (java_pkg_dir / "TitanForgeOtaProvider.java").write_text('''package com.titanforge.ota;
+
+          import android.app.Activity;
+          import android.app.AlertDialog;
+          import android.app.Application;
+          import android.app.ProgressDialog;
+          import android.content.ContentProvider;
+          import android.content.ContentValues;
+          import android.content.Context;
+          import android.content.Intent;
+          import android.content.pm.PackageInfo;
+          import android.database.Cursor;
+          import android.net.Uri;
+          import android.os.Build;
+          import android.os.Bundle;
+          import android.os.Handler;
+          import android.os.Looper;
+          import android.provider.Settings;
+          import androidx.core.content.FileProvider;
+          import org.json.JSONObject;
+          import java.io.BufferedReader;
+          import java.io.File;
+          import java.io.FileOutputStream;
+          import java.io.InputStream;
+          import java.io.InputStreamReader;
+          import java.lang.ref.WeakReference;
+          import java.net.HttpURLConnection;
+          import java.net.URL;
+
+          public class TitanForgeOtaProvider extends ContentProvider {
+              private static volatile boolean checkedThisLaunch = false;
+              private static WeakReference<Activity> topActivityRef = new WeakReference<>(null);
+              private static final Handler mainHandler = new Handler(Looper.getMainLooper());
+
+              @Override
+              public boolean onCreate() {
+                  Context ctx = getContext();
+                  if (ctx != null && ctx.getApplicationContext() instanceof Application) {
+                      Application app = (Application) ctx.getApplicationContext();
+                      app.registerActivityLifecycleCallbacks(new Application.ActivityLifecycleCallbacks() {
+                          @Override public void onActivityResumed(Activity activity) {
+                              topActivityRef = new WeakReference<>(activity);
+                              if (!checkedThisLaunch) {
+                                  checkedThisLaunch = true;
+                                  checkUpdateAsync(activity.getApplicationContext());
+                              }
+                          }
+                          @Override public void onActivityCreated(Activity a, Bundle b) {}
+                          @Override public void onActivityStarted(Activity a) {}
+                          @Override public void onActivityPaused(Activity a) {}
+                          @Override public void onActivityStopped(Activity a) {}
+                          @Override public void onActivitySaveInstanceState(Activity a, Bundle b) {}
+                          @Override public void onActivityDestroyed(Activity a) {}
+                      });
+                  }
+                  return true;
+              }
+
+              private static String getResString(Context ctx, String name) {
+                  int id = ctx.getResources().getIdentifier(name, "string", ctx.getPackageName());
+                  return id != 0 ? ctx.getString(id).trim() : "";
+              }
+
+              private static int getResInt(Context ctx, String name) {
+                  int id = ctx.getResources().getIdentifier(name, "integer", ctx.getPackageName());
+                  return id != 0 ? ctx.getResources().getInteger(id) : 0;
+              }
+
+              private static long getInstalledVersionCode(Context ctx) {
+                  try {
+                      PackageInfo pi = ctx.getPackageManager().getPackageInfo(ctx.getPackageName(), 0);
+                      return Build.VERSION.SDK_INT >= 28 ? pi.getLongVersionCode() : pi.versionCode;
+                  } catch (Exception e) { return 1L; }
+              }
+
+              private static void checkUpdateAsync(final Context appCtx) {
+                  new Thread(() -> {
+                      try {
+                          String repo = getResString(appCtx, "titan_forge_ota_repo");
+                          if (!repo.contains("/")) return;
+                          String localStamp = getResString(appCtx, "titan_forge_ota_stamp");
+                          int localRun = getResInt(appCtx, "titan_forge_ota_run");
+                          long localVc = getInstalledVersionCode(appCtx);
+
+                          String urlStr = "https://github.com/" + repo + "/releases/download/latest/update.json?t=" + System.currentTimeMillis();
+                          HttpURLConnection conn = (HttpURLConnection) new URL(urlStr).openConnection();
+                          conn.setConnectTimeout(12000);
+                          conn.setReadTimeout(12000);
+                          conn.setInstanceFollowRedirects(true);
+                          if (conn.getResponseCode() != 200) return;
+
+                          BufferedReader br = new BufferedReader(new InputStreamReader(conn.getInputStream()));
+                          StringBuilder sb = new StringBuilder();
+                          String line;
+                          while ((line = br.readLine()) != null) sb.append(line);
+                          br.close();
+
+                          JSONObject json = new JSONObject(sb.toString());
+                          int remoteVc = json.optInt("versionCode", 0);
+                          int remoteRun = json.optInt("runNumber", 0);
+                          String remoteStamp = json.optString("buildStamp", "").trim();
+                          String remoteName = json.optString("versionName", "New");
+                          String apkUrl = json.optString("apkUrl", "").trim();
+                          String notes = json.optString("notes", "New update ready.");
+
+                          boolean hasUpdate = apkUrl.startsWith("http") && (
+                              remoteVc > localVc ||
+                              (remoteRun > 0 && remoteRun > localRun) ||
+                              (!remoteStamp.isEmpty() && !localStamp.isEmpty() && !remoteStamp.equals(localStamp))
+                          );
+
+                          if (hasUpdate) {
+                              mainHandler.post(() -> showUpdateDialog(remoteName, notes, apkUrl));
+                          }
+                      } catch (Exception ignored) {}
+                  }).start();
+              }
+
+              private static void showUpdateDialog(String versionName, String notes, String apkUrl) {
+                  Activity act = topActivityRef.get();
+                  if (act == null || act.isFinishing()) return;
+                  new AlertDialog.Builder(act)
+                      .setTitle("Update Available (v" + versionName + ")")
+                      .setMessage(notes + "\n\nInstalls directly over your app without losing data.")
+                      .setPositiveButton("Update Now", (d, w) -> downloadAndInstall(act, apkUrl))
+                      .setNegativeButton("Later", null)
+                      .show();
+              }
+
+              private static void downloadAndInstall(Activity act, String apkUrl) {
+                  ProgressDialog pd = new ProgressDialog(act);
+                  pd.setTitle("Downloading Update...");
+                  pd.setProgressStyle(ProgressDialog.STYLE_HORIZONTAL);
+                  pd.setMax(100);
+                  pd.setCancelable(false);
+                  pd.show();
+
+                  final Context appCtx = act.getApplicationContext();
+                  new Thread(() -> {
+                      try {
+                          File outFile = new File(appCtx.getCacheDir(), "titan_ota_update.apk");
+                          if (outFile.exists()) outFile.delete();
+
+                          HttpURLConnection conn = (HttpURLConnection) new URL(apkUrl).openConnection();
+                          conn.setConnectTimeout(15000);
+                          conn.setReadTimeout(60000);
+                          conn.setInstanceFollowRedirects(true);
+                          int total = conn.getContentLength();
+                          InputStream is = conn.getInputStream();
+                          FileOutputStream fos = new FileOutputStream(outFile);
+                          byte[] buf = new byte[16384];
+                          long done = 0;
+                          int read;
+                          while ((read = is.read(buf)) != -1) {
+                              fos.write(buf, 0, read);
+                              done += read;
+                              if (total > 0) {
+                                  int pct = (int) ((done * 100L) / total);
+                                  mainHandler.post(() -> pd.setProgress(pct));
+                              }
+                          }
+                          fos.flush(); fos.close(); is.close();
+
+                          mainHandler.post(() -> {
+                              pd.dismiss();
+                              launchInstaller(appCtx, outFile);
+                          });
+                      } catch (Exception e) {
+                          mainHandler.post(pd::dismiss);
+                      }
+                  }).start();
+              }
+
+              private static void launchInstaller(Context ctx, File apkFile) {
+                  try {
+                      if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && !ctx.getPackageManager().canRequestPackageInstalls()) {
+                          Intent p = new Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES, Uri.parse("package:" + ctx.getPackageName()));
+                          p.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                          ctx.startActivity(p);
+                          return;
+                      }
+                      Uri uri = FileProvider.getUriForFile(ctx, ctx.getPackageName() + ".titanforge.ota.files", apkFile);
+                      Intent intent = new Intent(Intent.ACTION_VIEW);
+                      intent.setDataAndType(uri, "application/vnd.android.package-archive");
+                      intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_GRANT_READ_URI_PERMISSION);
+                      ctx.startActivity(intent);
+                  } catch (Exception ignored) {}
+              }
+
+              @Override public Cursor query(Uri u, String[] p, String s, String[] sa, String so) { return null; }
+              @Override public String getType(Uri u) { return null; }
+              @Override public Uri insert(Uri u, ContentValues v) { return null; }
+              @Override public int delete(Uri u, String s, String[] sa) { return 0; }
+              @Override public int update(Uri u, ContentValues v, String s, String[] sa) { return 0; }
+          }
+          '''.replace("          ", ""), encoding="utf-8")
+
+          # 5. Patch AndroidManifest.xml cleanly (permissions + auto-init provider + isolated FileProvider)
+          mf = app_dir / "src/main/AndroidManifest.xml"
+          if mf.exists():
+              mtxt = mf.read_text(encoding="utf-8")
+              if "android.permission.INTERNET" not in mtxt:
+                  mtxt = mtxt.replace("<application", '<uses-permission android:name="android.permission.INTERNET" />\n    <application', 1)
+              if "android.permission.REQUEST_INSTALL_PACKAGES" not in mtxt:
+                  mtxt = mtxt.replace("<application", '<uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />\n    <application', 1)
+              if "com.titanforge.ota.TitanForgeOtaProvider" not in mtxt:
+                  prov_xml = '''
+                  <provider
+                      android:name="com.titanforge.ota.TitanForgeOtaProvider"
+                      android:authorities="${applicationId}.titanforge.ota.init"
+                      android:exported="false" />
+                  <provider
+                      android:name="com.titanforge.ota.TitanForgeFileProvider"
+                      android:authorities="${applicationId}.titanforge.ota.files"
+                      android:exported="false"
+                      android:grantUriPermissions="true">
+                      <meta-data
+                          android:name="android.support.FILE_PROVIDER_PATHS"
+                          android:resource="@xml/titan_forge_ota_paths" />
+                  </provider>
+              </application>'''
+                  mtxt = mtxt.replace("</application>", prov_xml, 1)
+              mf.write_text(mtxt, encoding="utf-8")
+              print("Universal Zero-Config OTA Provider injected into AndroidManifest.xml!")
+          PYEOF
+
+      - name: Build Debug APK
+        if: steps.prep.outputs.mode != 'release'
+        run: ${{ steps.prep.outputs.cmd }} assembleDebug -PTITAN_UPDATE_REPO="${{ github.repository }}" --no-daemon
+
+      - name: Build & Sign Release APK + Generate OTA update.json
+        if: steps.prep.outputs.mode == 'release'
+        env:
+          TITAN_KEYSTORE_B64: ${{ secrets.TITAN_KEYSTORE_B64 }}
+          GH_REPO_FULL: ${{ github.repository }}
+          GH_RUN_NUM: ${{ github.run_number }}
+          GH_SHA_SHORT: ${{ github.sha }}
+        run: |
+          ${{ steps.prep.outputs.cmd }} assembleRelease -PTITAN_UPDATE_REPO="$GH_REPO_FULL" --no-daemon
+          RAW_APK="$(find app/build/outputs/apk/release -type f -name '*.apk' | head -n 1)"
+          if [ -z "$RAW_APK" ]; then
+            echo "No release APK found!"
+            exit 1
+          fi
+          mkdir -p titan_release_out
+          BUILD_TOOLS="$(ls -d "${ANDROID_HOME}/build-tools/"* | sort -V | tail -n 1)"
+          if [ -n "$TITAN_KEYSTORE_B64" ]; then
+            echo "Using Permanent Titan Forge Keystore Vault..."
+            printf "%s" "$TITAN_KEYSTORE_B64" | base64 -d > titan_release.p12
+            KS_FILE="titan_release.p12"
+            KS_TYPE="PKCS12"
+          else
+            echo "Generating fallback release keystore..."
+            keytool -genkeypair -v \
+              -keystore titan_release.jks \
+              -alias titan_key \
+              -keyalg RSA -keysize 2048 -validity 10000 \
+              -storepass titan1234 -keypass titan1234 \
+              -dname "CN=TitanForge, OU=Mobile, O=DeveloperTahir, L=Kolkata, S=WB, C=IN"
+            KS_FILE="titan_release.jks"
+            KS_TYPE="JKS"
+          fi
+          "${BUILD_TOOLS}/zipalign" -v -p 4 "$RAW_APK" titan_release_out/aligned.apk
+          "${BUILD_TOOLS}/apksigner" sign \
+            --ks "$KS_FILE" \
+            --ks-type "$KS_TYPE" \
+            --ks-key-alias titan_key \
+            --ks-pass pass:titan1234 \
+            --key-pass pass:titan1234 \
+            --out titan_release_out/app-release-signed.apk \
+            titan_release_out/aligned.apk
+          rm -f titan_release_out/aligned.apk titan_release.jks titan_release.p12
+
+          GFILE="app/build.gradle.kts"
+          [ -f "$GFILE" ] || GFILE="app/build.gradle"
+          VCODE="$(grep -E 'versionCode' "$GFILE" | head -n 1 | grep -oE '[0-9]+' | head -n 1 || true)"
+          VNAME="$(grep -E 'versionName' "$GFILE" | head -n 1 | sed -E 's/.*["'\'']([^"'\'']+)["'\''].*/\1/' || true)"
+          VCODE="${VCODE:-$GH_RUN_NUM}"
+          VNAME="${VNAME:-1.0}"
+          BUILD_STAMP="${GH_RUN_NUM}-${GH_SHA_SHORT:0:7}"
+
+          jq -n \
+            --argjson vc "$VCODE" \
+            --argjson rn "$GH_RUN_NUM" \
+            --arg vn "$VNAME" \
+            --arg bs "$BUILD_STAMP" \
+            --arg url "https://github.com/${GH_REPO_FULL}/releases/download/latest/app-release-signed.apk" \
+            --arg notes "New build v${VNAME} (#${GH_RUN_NUM}) is ready with the latest updates." \
+            '{versionCode: $vc, versionName: $vn, runNumber: $rn, buildStamp: $bs, apkUrl: $url, notes: $notes, forceUpdate: false}' \
+            > titan_release_out/update.json
+          cat titan_release_out/update.json
+
+      - name: Publish OTA Update to GitHub Releases (latest)
+        if: steps.prep.outputs.mode == 'release'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if gh release view latest >/dev/null 2>&1; then
+            gh release upload latest titan_release_out/app-release-signed.apk titan_release_out/update.json --clobber
+          else
+            gh release create latest titan_release_out/app-release-signed.apk titan_release_out/update.json \
+              --title "Latest Release" \
+              --notes "Auto-published by Titan Forge v4.0 Universal Auto-OTA."
+          fi
+
+      - name: Upload Debug APK
+        if: steps.prep.outputs.mode != 'release'
+        uses: actions/upload-artifact@v4
+        with:
+          name: titan-forge-apk
+          path: app/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
+
+      - name: Upload Signed Release APK
+        if: steps.prep.outputs.mode == 'release'
+        uses: actions/upload-artifact@v4
+        with:
+          name: titan-forge-apk
+          path: titan_release_out/app-release-signed.apk
+          if-no-files-found: error
